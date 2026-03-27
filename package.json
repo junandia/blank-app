@@ -1,0 +1,9 @@
+{
+  "name": "estatement-converter",
+  "version": "1.0.0",
+  "description": "E-Statement Bank Converter - Python Streamlit App",
+  "scripts": {
+    "dev": "./venv/bin/streamlit run app.py --server.port 8501 --server.headless true",
+    "start": "./venv/bin/streamlit run app.py --server.port 8501 --server.headless true"
+  }
+}
