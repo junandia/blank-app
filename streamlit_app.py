@@ -76,88 +76,20 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-def clean_amount(amount_str: Any) -> float:
-    """Membersihkan string amount menjadi float - menangani format yang rusak"""
-    if not amount_str:
+def clean_balance(balance_str: Any) -> float:
+    """Membersihkan string balance menjadi float - sama dengan API"""
+    if not balance_str:
         return 0.0
-
-    amount_str = str(amount_str)
-
-    # Handle corrupted format like "33,,550000,,000000..0000"
-    # This happens when PDF has overlapping text
-    # Try to extract the correct number pattern
-
-    # Remove any non-numeric except dots, commas, minus
-    cleaned = re.sub(r'[^\d.,\-]', '', amount_str)
-
-    # If there are multiple decimal separators, fix it
-    # Pattern like "33,,550000,,000000..0000" means overlapping digits
-    # We need to extract unique digits in order
-
-    # Try to find the most likely correct format
-    # Split by double separators
-    parts = re.split(r'[.,]{2,}', cleaned)
-
-    if len(parts) > 1:
-        # Reconstruct: take alternating or deduplicated parts
-        # "33,,550000,,000000..0000" -> might be "3,550,000.00"
-        # Extract digits only and reconstruct
-        all_digits = re.sub(r'[^\d]', '', cleaned)
-
-        # If we have many digits, it's likely a corrupted format
-        # Try to parse as Indonesian format: 3.550.000,00
-        if len(all_digits) > 10:
-            # Take unique consecutive digits
-            unique_digits = []
-            prev = None
-            for d in all_digits:
-                if d != prev:
-                    unique_digits.append(d)
-                    prev = d
-            all_digits = ''.join(unique_digits)
-
-        # Try to format as number with 2 decimal places
-        if len(all_digits) > 2:
-            # Last 2 digits are cents
-            try:
-                integer_part = all_digits[:-2]
-                decimal_part = all_digits[-2:]
-                return float(f"{integer_part}.{decimal_part}")
-            except:
-                pass
-
-    # Standard cleaning for normal format
-    # Indonesian format: 1.234.567,89 -> 1234567.89
-    cleaned = cleaned.replace('.', '').replace(',', '.')
-
+    cleaned = str(balance_str).replace(',', '').replace(' ', '').strip()
     try:
         return float(cleaned)
-    except ValueError:
+    except:
         return 0.0
 
 
-def extract_balance_from_row(row: list, num_cols: int) -> Tuple[Optional[float], int]:
-    """Extract balance from row and return with column index"""
-    balance = None
-    balance_col = -1
-
-    # Find the last numeric value in the row (that's usually the balance)
-    for i in range(len(row) - 1, -1, -1):
-        val = row[i]
-        if val and str(val).strip():
-            cleaned = clean_amount(val)
-            if cleaned > 0:
-                balance = cleaned
-                balance_col = i
-                break
-
-    return balance, balance_col
-
-
-def extract_transactions(pdf_file, debug_mode=False) -> Tuple[Dict[str, str], List[Dict], List[str]]:
-    """Ekstrak semua transaksi dari PDF"""
-    all_transactions = []
-    account_info = {
+def extract_account_info(text: str) -> Dict[str, Any]:
+    """Ekstrak informasi akun dari header PDF"""
+    info = {
         'account_name': '',
         'account_number': '',
         'account_type': '',
@@ -165,29 +97,127 @@ def extract_transactions(pdf_file, debug_mode=False) -> Tuple[Dict[str, str], Li
         'currency': 'IDR',
         'ledger_balance': 0.0
     }
-    debug_logs = []
+
+    lines = text.split('\n')
+
+    # Extract account name
+    for i, line in enumerate(lines):
+        if 'ACCOUNT STATEMENT' in line and i + 1 < len(lines):
+            next_line = lines[i + 1]
+            name_match = re.match(r'^([A-Z][A-Z\s]+?)\s+Account No', next_line)
+            if name_match:
+                info['account_name'] = name_match.group(1).strip()
+            break
+
+    # Extract account number
+    acc_match = re.search(r'Account No\.?\s*:\s*([\d]+(?:\s*/\s*[A-Z]+)?)', text)
+    if acc_match:
+        info['account_number'] = acc_match.group(1).strip()
+
+    # Extract account type
+    type_match = re.search(r'Account Type\s*:\s*(\w+)', text)
+    if type_match:
+        info['account_type'] = type_match.group(1)
+
+    # Extract period
+    period_match = re.search(r'Period\s*:\s*([\d]+-[A-Za-z]+-[\d]+\s*-\s*[\d]+-[A-Za-z]+-[\d]+)', text)
+    if period_match:
+        info['period'] = period_match.group(1)
+
+    # Extract ledger balance from text
+    ledger_match = re.search(r'Ledger Balance:\s*([\d.,]+)', text)
+    if ledger_match:
+        info['ledger_balance'] = clean_balance(ledger_match.group(1))
+
+    return info
+
+
+def parse_row(row: List, prev_balance: Optional[float], num_cols: int) -> Tuple[Optional[Dict], Optional[float]]:
+    """Parse satu baris tabel menjadi transaksi - sama dengan logic API"""
+
+    # Skip header rows
+    first_cell = str(row[0]) if row[0] else ''
+    if 'Posting Date' in first_cell or 'Ledger Balance' in first_cell or first_cell == '' or first_cell == 'None':
+        return None, prev_balance
+
+    # Check for valid date
+    if not re.search(r'\d{2}/\d{2}/\d{4}', first_cell):
+        return None, prev_balance
+
+    posting_date = str(row[0]).strip()
+
+    # Handle different column structures
+    if num_cols >= 10:
+        # Page 1 structure: 10 columns
+        effective_date = str(row[2]).strip() if len(row) > 2 and row[2] else posting_date
+        branch = str(row[3]).replace('\n', ' ').strip() if len(row) > 3 and row[3] else ''
+        journal = str(row[4]).strip() if len(row) > 4 and row[4] else ''
+        description = str(row[5]).replace('\n', ' ').strip() if len(row) > 5 and row[5] else ''
+        db_cr = str(row[7]).strip() if len(row) > 7 and row[7] in ['D', 'K'] else ''
+        balance_raw = row[9] if len(row) > 9 else None
+    else:
+        # Page 2+ structure: 8 columns
+        effective_date = str(row[1]).strip() if len(row) > 1 and row[1] else posting_date
+        branch = str(row[2]).replace('\n', ' ').strip() if len(row) > 2 and row[2] else ''
+        journal = str(row[3]).strip() if len(row) > 3 and row[3] else ''
+        description = str(row[4]).replace('\n', ' ').strip() if len(row) > 4 and row[4] else ''
+        db_cr = str(row[6]).strip() if len(row) > 6 and row[6] in ['D', 'K'] else ''
+        balance_raw = row[7] if len(row) > 7 else None
+
+    # Clean up text
+    branch = re.sub(r'\s+', ' ', branch)
+    description = re.sub(r'\s+', ' ', description)
+
+    # Parse balance
+    current_balance = clean_balance(balance_raw)
+
+    # Skip if no valid data
+    if not posting_date or not db_cr or current_balance == 0:
+        return None, prev_balance
+
+    # Calculate amount from balance difference
+    if prev_balance is not None:
+        if db_cr == 'D':
+            amount = prev_balance - current_balance
+        else:  # K = Credit
+            amount = current_balance - prev_balance
+    else:
+        prev_balance = current_balance
+        return None, prev_balance
+
+    trans = {
+        'posting_date': posting_date,
+        'effective_date': effective_date,
+        'branch': branch,
+        'journal': journal,
+        'description': description,
+        'amount': abs(amount),
+        'db_cr': db_cr,
+        'balance': current_balance
+    }
+
+    return trans, current_balance
+
+
+def extract_transactions(pdf_file, debug_mode=False) -> Tuple[Dict[str, Any], List[Dict], List[str]]:
+    """Ekstrak semua transaksi dari PDF - sama dengan logic API"""
+    all_transactions = []
+    account_info = {}
     prev_balance = None
+    debug_logs = []
 
     with pdfplumber.open(pdf_file) as pdf:
-        # Get account info from first page text
+        # Get account info from first page
         first_text = pdf.pages[0].extract_text() or ""
-
-        # Extract account name
-        name_match = re.search(r'^([A-Z][A-Z\s]+?)\s+Account No', first_text, re.MULTILINE)
-        if name_match:
-            account_info['account_name'] = name_match.group(1).strip()
-
-        # Extract account number
-        acc_match = re.search(r'Account No\.?\s*:\s*([\d]+(?:\s*/\s*[A-Z]+)?)', first_text)
-        if acc_match:
-            account_info['account_number'] = acc_match.group(1).strip()
-
-        # Extract period
-        period_match = re.search(r'Period\s*:\s*([\d]+-[A-Za-z]+-[\d]+\s*-\s*[\d]+-[A-Za-z]+-[\d]+)', first_text)
-        if period_match:
-            account_info['period'] = period_match.group(1)
+        account_info = extract_account_info(first_text)
 
         debug_logs.append(f"Account Info: {account_info}")
+
+        # Get initial ledger balance from text
+        ledger_match = re.search(r'Ledger Balance:\s*([\d.,]+)', first_text)
+        if ledger_match:
+            prev_balance = clean_balance(ledger_match.group(1))
+            debug_logs.append(f"Initial Ledger Balance from text: {prev_balance}")
 
         # Process all pages
         for page_num, page in enumerate(pdf.pages):
@@ -195,7 +225,7 @@ def extract_transactions(pdf_file, debug_mode=False) -> Tuple[Dict[str, str], Li
             debug_logs.append(f"\n=== Page {page_num + 1} - Found {len(tables)} tables ===")
 
             for table_idx, table in enumerate(tables):
-                if not table or len(table) < 1:
+                if not table or len(table) < 2:
                     continue
 
                 num_cols = len(table[0]) if table[0] else 0
@@ -205,117 +235,10 @@ def extract_transactions(pdf_file, debug_mode=False) -> Tuple[Dict[str, str], Li
                     for i, row in enumerate(table[:5]):
                         debug_logs.append(f"  Row {i}: {row}")
 
-                for row_idx, row in enumerate(table):
-                    # Check for Ledger Balance in first row (Page 1)
-                    first_cell = str(row[0]) if row[0] else ''
-
-                    if 'Ledger Balance' in first_cell:
-                        # Extract balance from this row
-                        for cell in row:
-                            if cell and str(cell).strip():
-                                val = clean_amount(cell)
-                                if val > 0:
-                                    prev_balance = val
-                                    account_info['ledger_balance'] = val
-                                    debug_logs.append(f"Found Ledger Balance: {prev_balance}")
-                                    break
-                        continue
-
-                    # Skip header rows
-                    if 'Posting Date' in first_cell or first_cell == '' or first_cell == 'None':
-                        continue
-
-                    # Check for valid date
-                    if not re.search(r'\d{2}/\d{2}/\d{4}', first_cell):
-                        continue
-
-                    # Extract posting date
-                    posting_date = str(row[0]).strip()
-
-                    # Handle different column structures
-                    if num_cols >= 10:
-                        # Page 1 structure: 10 columns
-                        # Row: [Posting Date, ?, Effective Date, Branch, Journal, Desc, Amount, D/K, ?, Balance]
-                        effective_date = str(row[2]).strip() if len(row) > 2 and row[2] else posting_date
-                        branch = str(row[3]).replace('\n', ' ').strip() if len(row) > 3 and row[3] else ''
-                        journal = str(row[4]).strip() if len(row) > 4 and row[4] else ''
-
-                        # Description could be in column 1 or 5
-                        desc1 = str(row[1]).replace('\n', ' ').strip() if len(row) > 1 and row[1] else ''
-                        desc2 = str(row[5]).replace('\n', ' ').strip() if len(row) > 5 and row[5] else ''
-                        description = f"{desc1} {desc2}".strip() if desc1 or desc2 else ''
-
-                        # D/K indicator
-                        db_cr = ''
-                        if len(row) > 7 and str(row[7]).strip().upper() in ['D', 'K']:
-                            db_cr = str(row[7]).strip().upper()
-
-                        # Balance is in the last column with numeric value
-                        balance, balance_col = extract_balance_from_row(row, num_cols)
-
-                    elif num_cols >= 8:
-                        # Page 2+ structure: 8 columns
-                        # Row: [Posting Date, Effective Date, Branch, Journal, Desc, Amount, D/K, Balance]
-                        effective_date = str(row[1]).strip() if len(row) > 1 and row[1] else posting_date
-                        branch = str(row[2]).replace('\n', ' ').strip() if len(row) > 2 and row[2] else ''
-                        journal = str(row[3]).strip() if len(row) > 3 and row[3] else ''
-                        description = str(row[4]).replace('\n', ' ').strip() if len(row) > 4 and row[4] else ''
-
-                        # D/K indicator
-                        db_cr = ''
-                        if len(row) > 6 and str(row[6]).strip().upper() in ['D', 'K']:
-                            db_cr = str(row[6]).strip().upper()
-
-                        # Balance is in the last column
-                        balance, balance_col = extract_balance_from_row(row, num_cols)
-                    else:
-                        continue
-
-                    # Clean up text
-                    branch = re.sub(r'\s+', ' ', branch)
-                    description = re.sub(r'\s+', ' ', description)
-
-                    # Skip if no valid balance
-                    if balance is None or balance == 0:
-                        continue
-
-                    current_balance = balance
-
-                    # First transaction sets prev_balance
-                    if prev_balance is None:
-                        prev_balance = current_balance
-                        debug_logs.append(f"Setting initial prev_balance: {prev_balance}")
-                        continue
-
-                    # Skip if balance unchanged
-                    if current_balance == prev_balance:
-                        continue
-
-                    # Calculate amount from balance difference
-                    if current_balance < prev_balance:
-                        amount = prev_balance - current_balance
-                        db_cr = 'D'  # Debit - money out
-                    else:
-                        amount = current_balance - prev_balance
-                        db_cr = 'K'  # Credit - money in
-
-                    # Skip zero amounts
-                    if amount == 0:
-                        continue
-
-                    trans = {
-                        'posting_date': posting_date,
-                        'effective_date': effective_date,
-                        'branch': branch,
-                        'journal': journal,
-                        'description': description,
-                        'amount': abs(amount),
-                        'db_cr': db_cr,
-                        'balance': current_balance
-                    }
-
-                    all_transactions.append(trans)
-                    prev_balance = current_balance
+                for row in table:
+                    trans, prev_balance = parse_row(row, prev_balance, num_cols)
+                    if trans:
+                        all_transactions.append(trans)
 
         debug_logs.append(f"\nTotal transactions extracted: {len(all_transactions)}")
 
